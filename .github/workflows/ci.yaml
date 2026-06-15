@@ -3,16 +3,36 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/note-svc
 
 jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Run Gitleaks
+        run: gitleaks detect --source . --verbose
+
   build-and-deploy:
+    needs: gitleaks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
 
     steps:
       - name: Checkout app code
@@ -25,14 +45,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build image (local, not pushed yet)
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:latest
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-note-svc
+          path: sbom.cdx.json
+          retention-days: 90
+
+      - name: Push image to GHCR
+        id: push
+        run: |
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE }}:${{ github.sha }})
+          DIGEST_HASH=$(echo "$DIGEST" | cut -d'@' -f2)
+          echo "digest=$DIGEST_HASH" >> "$GITHUB_OUTPUT"
+          echo "Image digest: $DIGEST_HASH"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with Cosign (keyless)
+        run: |
+          cosign sign --yes ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
 
       - name: Checkout config repo
         uses: actions/checkout@v4
@@ -41,17 +100,17 @@ jobs:
           token: ${{ secrets.CONFIG_REPO_TOKEN }}
           path: gitops-config
 
-      - name: Update image tag in config repo
+      - name: Update image digest in config repo
         run: |
           cd gitops-config
-          IMAGE_TAG="${{ env.IMAGE }}:${{ github.sha }}"
-          sed -i "s|image: ghcr.io/.*/note-svc:.*|image: ${IMAGE_TAG}|" apps/note-svc/base/deployment.yaml
+          DIGEST="${{ steps.push.outputs.digest }}"
+          sed -i "s|image: ghcr.io/.*/note-svc[:@].*|image: ghcr.io/nhatminh06/note-svc@${DIGEST}|" apps/note-svc/base/deployment.yaml
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "deploy: note-svc ${{ github.sha }}"
+            git commit -m "deploy: note-svc digest ${DIGEST:0:16}"
             git push
           fi
